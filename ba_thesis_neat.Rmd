@@ -1,0 +1,1151 @@
+---
+title: 'Equity versus Predation: Third-Party Enforcement of the Chicago Wheel Tax'
+author: "Jasper Snowden"
+date: "1/31/2022"
+output:
+  pdf_document: 
+    toc: yes
+  html_document: 
+    toc: yes
+    theme: readable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Downloading and Cleaning the Data
+
+```{r Required Libraries, message=FALSE, warning=FALSE}
+## Loading the Required Libraries
+#  Core Packages  
+library(tidyverse)
+library(readr)
+library(here)
+
+# Dating Manipulation
+library(lubridate)
+
+# Data Visualization
+library(kableExtra)
+library(ggforce)
+
+# Data Analysis
+library(did)
+```
+
+```{r Data Tidying}
+## Command to Render the Data Tidying R Script
+## This combines the community profile data with the city sticker data
+rmarkdown::render("data_tidying.R")
+```
+
+## Loading in the Chicago City Sticker Ticket Data from the Folder
+
+```{r Data Import, echo=FALSE}
+## Using the Readr package to load the chi_tickets df
+#  Explcitly defining the column types to help prep the data for the model workflow
+chi_tickets <- read_csv("tidy_data/chi_tickets.csv", 
+    col_types = cols(after_holiday = col_logical(), 
+        annual_vehicle_miles = col_number(), 
+        asian = col_number(), 
+        before_holiday = col_logical(), 
+        black = col_number(), 
+        blockgroup_geoid = col_character(), 
+        carpool = col_number(), 
+        comm_other = col_number(), 
+        current_amount_due = col_number(), 
+        day = col_double(), 
+        drove_alone = col_number(), 
+        fine_level1_amount = col_number(), 
+        fine_level2_amount = col_number(), 
+        geocoded_lat = col_number(), 
+        geocoded_lng = col_number(), 
+        hisp = col_number(), 
+        holiday = col_logical(), 
+        hour = col_double(), 
+        license_plate_number = col_character(), 
+        license_plate_type = col_character(), 
+        med_inc = col_number(), 
+        month = col_double(), 
+        notice_level = col_character(), 
+        notice_number = col_character(), 
+        officer = col_character(), 
+        other = col_number(), 
+        park_access = col_number(), 
+        ticket_number = col_character(), 
+        ticket_queue = col_character(), 
+        ticket_queue_date = col_character(), 
+        ticket_revenue = col_number(), 
+        total_commuters = col_number(), 
+        total_payments = col_number(), 
+        total_penalties = col_number(), 
+        tract_id = col_character(), 
+        transit = col_number(), 
+        two_days_after_holiday = col_logical(), 
+        unit = col_character(), 
+        unit_description = col_character(), 
+        vehicle_make = col_character(), 
+        violation_code = col_character(), 
+        violation_description = col_character(), 
+        walk_bike = col_number(), 
+        ward = col_character(), 
+        white = col_number(), 
+        work_at_home = col_number(), 
+        year = col_double(), 
+        zipcode = col_character()))%>%
+   filter(year %in% (2010:2014))
+```
+
+#  Filtering the Data to Years, Areas, and Units Most Relevant to the 2012 Policy Change
+
+```{r Data Exploration}
+## Filtering the data to Unit Tickets by year to explore the relationship between unit and total tickets
+# Dropping units that issue less than 4500 tickets in a year (This leaves me with the top 15 units)
+unit_tickets_per_year <- chi_tickets %>%
+  group_by(unit, year)%>%
+  count()%>%
+  rename(total_tickets = "n") %>%
+  filter(total_tickets > 4500)%>%
+  group_by(unit)%>%
+  summarise(mean(total_tickets))%>%
+  rename(total_tickets = 'mean(total_tickets)')%>%
+  arrange(desc(total_tickets))%>%
+  slice(1:25)
+
+
+unit_tickets_per_year_table <- unit_tickets_per_year %>%
+  kbl()%>%
+  kable_styling()
+
+unit_tickets_per_year_table
+remove(unit_tickets_per_year_table)
+
+
+## The Top Units only produce a fraction of what the DOF does is tickets per year. I will try to keep these proportions in mind when deciding on control and experiment groups 
+## DOF = 40% 
+## Serco = 10%
+## CPD (Total) = 38%
+## CPD (Mean) = 4%
+
+unit_tickets_boxplot <- unit_tickets_per_year%>%
+  ggplot(mapping = aes(x = unit, 
+                       y = total_tickets,
+                       color = unit))+
+  geom_boxplot(outlier.color = "red")+
+  xlab("Unit")+
+  ylab("Average Tickets Per Year")+
+  ggtitle("Average Tickets Per Year by Unit w/ DOF")+
+  theme_classic()
+
+plot(unit_tickets_boxplot)
+## The DOF is by and large the greatest single unit originator of tickets 
+
+## Recreating the boxplot without the DOF to clarify the results
+unit_tickets_boxplot_no_dof <- unit_tickets_per_year%>%
+  filter(unit != "498")%>%
+  ggplot(mapping = aes(x = unit, 
+                       y = total_tickets,
+                       color = unit))+
+  geom_boxplot(outlier.color = "red")+
+  xlab("Unit")+
+  ylab("Average Tickets Per Year")+
+  ggtitle("Average Tickets Per Year by Unit w/o DOF")+
+  theme_classic()
+
+plot(unit_tickets_boxplot_no_dof)
+
+remove(unit_tickets_boxplot, unit_tickets_boxplot_no_dof)
+remove(unit_tickets_per_year)
+## As can be seen from the first boxplot unit 498 (Chicago DOF) consitently issues the most tickets per unit over the time period
+## When viewed without the department of finance the average of the dataset is about 6000 tickets per unit
+
+
+# The DOF (498) City Clerk Office (501) and Serco - Private Contractor (502) are on average the greatest originators of city sticker tickets with some CPD units following like Austin and East Garfield Park. 
+
+# These CPD units are variable with different jurisdictions beyond one community area. I will not be analyzing CPD practices but this is an important fact to keep in mind when creating peer groups.
+```
+
+# Creating the Control and Experiment Peer Groups
+
+```{r Serco Exploration, message=FALSE, warning=FALSE}
+## Checking for community areas where serco was most active and least active
+serco_tickets <- chi_tickets %>%
+  filter(unit == "502" | unit == "504")%>%
+  group_by(community_area_name, year)%>%
+  count()%>%
+  rename(total_tickets = "n")%>%
+  group_by(community_area_name)%>%
+  summarise(mean(total_tickets))%>%
+  rename(mean_tickets ='mean(total_tickets)')%>%
+  arrange(desc(mean_tickets))
+
+serco_tickets_tbl <- serco_tickets %>%
+  slice(1:25)%>%
+  kbl()%>%
+  kable_styling()
+serco_tickets_tbl
+
+remove(serco_tickets_tbl)
+
+## Repeating the above excercise for the CPD units
+cpd_tickets <- chi_tickets %>%
+  filter(unit == "15" | unit == "11" |
+         unit == "10" | unit == "4" |
+         unit == "6" | unit == "3" |
+         unit == "8" | unit == "2" |
+         unit == "22" | unit == "412" | 
+          unit == "25")%>%
+  group_by(community_area_name, year)%>%
+  count()%>%
+  rename(total_tickets = "n")%>%
+  group_by(community_area_name)%>%
+  summarise(mean(total_tickets))%>%
+  rename(mean_tickets ='mean(total_tickets)')%>%
+  arrange(desc(mean_tickets))
+
+cpd_tickets_tbl <-cpd_tickets %>%
+  slice(1:25)%>%
+  kbl()%>%
+  kable_styling()
+cpd_tickets_tbl
+
+remove(cpd_tickets_tbl)
+
+## Repeating the above excercise for the City Units
+city_tickets <- chi_tickets %>%
+  filter(unit == "498" | unit == "501")%>%
+  group_by(community_area_name, year)%>%
+  count()%>%
+  rename(total_tickets = "n")%>%
+  group_by(community_area_name)%>%
+  summarise(mean(total_tickets))%>%
+  rename(mean_tickets ='mean(total_tickets)')%>%
+  arrange(desc(mean_tickets))
+
+city_tickets_tbl <- city_tickets %>%
+  slice(1:25)%>%
+  kbl()%>%
+  kable_styling()
+city_tickets_tbl
+
+remove(city_tickets_tbl)
+## Serco is most active in Lakeview, Near North Side, West Town, Lincoln Park, Near West Side, and Logan Square
+
+## City Units are most active in South Lawndale, Austin, South Shore, West Town, Near West Side, and Near North Side
+
+## CPD is most active in Austin, North Lawndale, Auburn Gresham, Chicao Lawn, Humboldt Park, and South Shore
+
+
+
+#### Confirming Serco is the primary ticketer in the Experiment Group and that DOF is the primary ticketer in the control ############################################
+
+## Finding the average tickets issued by community area to create a minimum level of tickets for the community areas in the study
+cca_avgs <- chi_tickets %>%
+  group_by(community_area_number, year)%>%
+  count()%>%
+  rename(tickets_per_cca = 'n')%>%
+  mutate(tickets_per_cca = as.numeric(tickets_per_cca), .keep = "unused")%>%
+  group_by(community_area_number)%>%
+  summarise(mean(tickets_per_cca))%>%
+  rename(avg_tickets_per_cca = 'mean(tickets_per_cca)')%>%
+  ggplot(mapping = aes(x = community_area_number,
+                    y = avg_tickets_per_cca))+
+  geom_col()+
+  geom_hline(aes(yintercept= mean(avg_tickets_per_cca)))+
+ xlab("Community Area Number")+
+ ylab("Average Tickets Per Year")+
+ ggtitle("Average Tickets Per Year By Community Area")+
+  xlim(1,78)+
+  theme_classic()
+
+plot(cca_avgs)
+remove(cca_avgs)
+
+## The Average total tickets are around 2500 oer community area. Running the above analysis with only community areas issuing atleast the avg number of tickets
+cca_avgs_top_cca <- chi_tickets %>%
+  group_by(community_area_number, year)%>%
+  count()%>%
+  rename(tickets_per_cca = 'n')%>%
+  mutate(tickets_per_cca = as.numeric(tickets_per_cca), .keep = "unused")%>%
+  group_by(community_area_number)%>%
+  summarise(mean(tickets_per_cca))%>%
+  rename(avg_tickets_per_cca = 'mean(tickets_per_cca)')%>%
+  filter(avg_tickets_per_cca >= 2500)%>%
+  ggplot(mapping = aes(x = community_area_number,
+                    y = avg_tickets_per_cca))+
+  geom_col()+
+  geom_hline(aes(yintercept= mean(avg_tickets_per_cca)))+
+ xlab("Community Area Number")+
+ ylab("Average Tickets Per Year")+
+ ggtitle("Average Tickets Per Year By Community Area - Minimum 2500 Tickets")+
+  xlim(1,78)+
+  theme_classic()
+
+
+plot(cca_avgs_top_cca)
+remove(cca_avgs_top_cca)
+
+## Viewing the plot as a table
+cca_avgs_top_cca_table <- chi_tickets %>%
+  group_by(community_area_name, community_area_number, year)%>%
+  count()%>%
+  rename(tickets_per_cca = 'n')%>%
+  mutate(tickets_per_cca = as.numeric(tickets_per_cca), .keep = "unused")%>%
+  group_by(community_area_name, community_area_number)%>%
+  summarise(mean(tickets_per_cca))%>%
+  rename(avg_tickets_per_cca = 'mean(tickets_per_cca)')%>%
+  filter(avg_tickets_per_cca >= 2000)%>%
+  arrange(desc(avg_tickets_per_cca))%>%
+  slice(1:25)
+
+cca_avgs_top_cca_table
+
+## The Averages of these community areas is much closer to 4000.
+## Finding what percentage of tickets are initiated by each unit in each community area for the benchmark comparison
+
+serco_cca_select <- chi_tickets %>%
+  group_by(community_area_name, unit, year)%>%
+  count()%>%
+  rename(tickets = 'n')%>%
+  mutate(tickets = as.numeric(tickets), 
+         .keep = "unused")%>%
+  mutate(serco_tickets = if_else(unit == "502" |unit == "504",
+                                 tickets, 0))%>%
+  group_by(community_area_name, year)%>%
+  mutate(pct_serco = 1000 *(serco_tickets/ sum(tickets)))%>%
+  group_by(community_area_name)%>%
+  filter(sum(tickets) > 2000)%>%
+  summarise(mean(pct_serco))%>%
+  rename(percent_serco_enforced = 'mean(pct_serco)')%>%
+  arrange(desc(percent_serco_enforced))%>%
+  slice(1:25)
+
+serco_cca_select
+
+## city Activity
+city_cca_select <- chi_tickets %>%
+  group_by(community_area_name, unit, year)%>%
+  count()%>%
+  rename(tickets = 'n')%>%
+  mutate(tickets = as.numeric(tickets), 
+         .keep = "unused")%>%
+  mutate(dof_tickets = if_else(unit == "501" | unit == "498",
+                                 tickets,  0 ))%>%
+  group_by(community_area_name, year)%>%
+  mutate(pct_dof = 1000* (dof_tickets/ sum(tickets)))%>%
+  group_by(community_area_name)%>%
+  filter(sum(tickets) > 2000)%>%
+  filter(sum(dof_tickets) > 800)%>%
+  summarise(mean(pct_dof))%>%
+  rename(percent_dof_enforced = 'mean(pct_dof)')%>%
+  arrange(desc(percent_dof_enforced))%>%
+  slice(1:25)
+
+# CPD Activity
+cpd_cca_select <- chi_tickets %>%
+  group_by(community_area_name, unit, year)%>%
+  count()%>%
+  rename(tickets = 'n')%>%
+  mutate(tickets = as.numeric(tickets), 
+         .keep = "unused")%>%
+  mutate(cpd_tickets = if_else(unit == "15" | 
+                               unit == "11" |
+                               unit == "10" | 
+                               unit == "4" |
+                               unit == "6" | 
+                               unit == "3" |
+                               unit == "8" | 
+                               unit == "2" |
+                               unit == "22" | 
+                               unit == "412" |
+                               unit == "25",
+                               tickets, 0))%>%
+  group_by(community_area_name, year)%>%
+  mutate(pct_cpd = 1000 *(cpd_tickets/ sum(tickets)))%>%
+  group_by(community_area_name)%>%
+  filter(sum(tickets) > 2500)%>%
+  summarise(mean(pct_cpd))%>%
+  rename(percent_cpd_enforced = 'mean(pct_cpd)')%>%
+  arrange(desc(percent_cpd_enforced))%>%
+  slice(1:25)
+
+cpd_cca_select 
+
+
+## Combining the observations into one table to decide on a peer group 
+## Criteria: Average or higher serco enforcement for Serco neighborhoods 
+## (i.e., 10% or more)
+## Criteria: Less than 7% Serco enforced for City Neighborhoods + 
+## Less than 15% police enforced for City Neighborhoods
+
+serco_cca_select_comparison <- cpd_cca_select%>%
+  left_join(serco_cca_select , by = "community_area_name")%>%
+  left_join(city_cca_select, by = "community_area_name")%>%
+  left_join(cca_avgs_top_cca_table, by = "community_area_name")%>%
+  slice(1:25)%>%
+  kbl()%>%
+  kable_styling() 
+
+city_cca_select
+serco_cca_select_comparison
+
+## The Serco neighborhoods will be LAKE VIEW, NEAR NORTH SIDE", "WEST TOWN", & "LINCOLN PARK"
+         
+## The City neighborhoods will be BRIGHTON PARK, NEAR WEST SIDE, ROGERS PARK, & PORTAGE PARK
+
+
+
+remove(city_cca_select)
+remove(serco_cca_select)
+remove(cpd_cca_select)
+remove(serco_cca_select_comparison)
+remove(cca_avgs_top_cca_table)
+```
+
+# Confirming The Parallel Trends Assumption
+
+```{r Parallel Trends Assumption Test, message=FALSE, warning=FALSE}
+## Confirming the Parellel Trends Assumption for these neighborhoods
+## Creating a data frame with and indicator for control vs experiment group
+serco_trends <- chi_tickets %>%
+  filter(community_area_name == "LAKE VIEW"| 
+         community_area_name == "NEAR NORTH SIDE"| 
+         community_area_name == "WEST TOWN"|
+         community_area_name == "LINCOLN PARK"|
+         community_area_name == "BRIGHTON PARK"|
+         community_area_name == "NEAR WEST SIDE"|
+         community_area_name == "ROGERS PARK"|
+         community_area_name == "PORTAGE PARK")%>%
+  mutate(serco_area = if_else(
+    community_area_number %in% c("6", "7", "8", "24"), 1, 0))
+
+
+## Average Tickets over the time period
+serco_trends_mean_tickets <- serco_trends %>%
+  group_by(community_area_name, year)%>%
+  count()%>%
+  rename(total_tickets = "n")%>%
+  group_by(community_area_name)%>%
+  summarise(mean(total_tickets))%>%
+  rename(mean_tickets ='mean(total_tickets)')%>%
+  arrange(desc(mean_tickets))
+
+serco_trends_mean_tickets_tbl <- serco_trends_mean_tickets%>%
+  kbl()%>%
+  kable_styling()
+
+serco_trends_mean_tickets_tbl
+
+remove(serco_trends_mean_tickets, serco_trends_mean_tickets_tbl)
+
+## Image of the parallel trends assumption test. As can be seen from the community area plots, trends are consistent between neighborhoods and different between control and experiment groups
+serco_trends_linegraphs <- serco_trends %>%
+   mutate(issue_date = as.Date(issue_date, "%d/%m/%Y"),.keep = "unused")%>%
+  group_by(issue_date, community_area_name, serco_area)%>%
+  count()%>%
+  rename(tickets_per_day = "n")%>%
+  mutate(serco_area = as.character(serco_area))%>%
+  ggplot(mapping = aes(x = issue_date, y = tickets_per_day, color = serco_area))+
+  scale_color_manual(values = c("blue", "red"))+
+  geom_line(linetype = "dashed")+
+  geom_smooth()+
+  facet_wrap(~ community_area_name)+
+  geom_vline(xintercept = as.Date("2012-02-01"))+
+  coord_cartesian(ylim = c(0, 150))+
+  theme_classic()
+ 
+plot(serco_trends_linegraphs)
+remove(serco_trends_linegraphs)
+
+
+## Monthly Tickets over time
+serco_trends_linegraph <- serco_trends %>%
+   mutate(issue_date = as.Date(issue_date, "%d/%m/%Y"),.keep = "unused")%>%
+  group_by(issue_date, serco_area)%>%
+  count()%>%
+  rename(tickets_per_day = "n")%>%
+  mutate(serco_area = as.character(serco_area))%>%
+  ggplot(mapping = aes(x = issue_date, 
+                       y = tickets_per_day, 
+                       color = serco_area), 
+         alpha = 0.01)+
+  geom_point(linetype = "dashed", width = 0.1, alpha = 0.01)+
+  scale_color_manual(values = c("blue", "red"))+
+  geom_smooth()+
+  geom_vline(xintercept = as.Date("2012-02-01"))+
+  coord_cartesian(ylim = c(0, 100))+ 
+  xlab("Ticket Issue Date")+
+  ylab("Tickets Issued in a Day")+
+  ggtitle("Average Tickets Per Day: Serco Areas v. City Areas")+
+  theme_classic()
+
+plot(serco_trends_linegraph)
+remove(serco_trends_linegraph)
+
+serco_trends_linegraph_point <- serco_trends %>%
+   mutate(issue_date = as.Date(issue_date, "%d/%m/%Y"),.keep = "unused")%>%
+  mutate(serco_area = as.character(serco_area))%>%
+  group_by(issue_date, serco_area)%>%
+  count()%>%
+  rename(tickets_per_day = "n")%>%
+  ggplot(mapping = aes(x = issue_date, 
+                       y = tickets_per_day, 
+                       color = serco_area))+
+  scale_color_manual(values = c("blue", "red"))+
+  geom_line(alpha = 0.001)+
+  geom_smooth(se = F)+
+  geom_vline(xintercept = as.Date("2012-02-01"))+
+  geom_vline(xintercept = as.Date("2011-08-01"), linetype = "dashed")+
+  coord_cartesian(ylim = c(0, 75))+
+  scale_x_date(limits = as.Date(c("2010-02-01","2014-02-01")))+
+  xlab("Ticket Issue Date")+
+  ylab("Tickets Issued in a Day")+
+  ggtitle("Average Tickets Per Day: Serco Areas v. City Areas")+
+  theme_classic()
+
+plot(serco_trends_linegraph_point)
+remove(serco_trends_linegraph_point)
+
+## Total Penalties
+serco_rev_linegraph_point <- serco_trends %>%
+   mutate(issue_date = as.Date(issue_date, "%d/%m/%Y"),.keep = "unused")%>%
+  mutate(serco_area = as.character(serco_area))%>%
+  group_by(issue_date, serco_area, community_area_name)%>%
+  summarise(mean(total_penalties))%>%
+  rename(penalties_per_day = 'mean(total_penalties)')%>%
+  ggplot(mapping = aes(x = issue_date, 
+                       y = penalties_per_day, 
+                       color = serco_area))+
+  scale_color_manual(values = c("blue", "red"))+
+  geom_line(alpha = 0.001)+
+  geom_smooth(se = F)+
+  geom_vline(xintercept = as.Date("2012-02-01"))+
+  geom_vline(xintercept = as.Date("2011-08-01"), linetype = "dashed")+
+  scale_x_date(limits = as.Date(c("2010-02-01","2014-02-01")))+
+  coord_cartesian(ylim = c(-250, 250))+
+  xlab("Ticket Issue Date")+
+  ylab("Penalties Issued in a Day")+
+  ggtitle("Average Penalties Per Day: Serco Areas v. City Areas")+
+  theme_classic()
+
+
+plot(serco_rev_linegraph_point)
+remove(serco_rev_linegraph_point)
+
+
+## The Parellel Trends assumption appears to hold Neither group crosses over in terms of total tickets during the time period though serco areas are clearly targeted for more penalties on average. As the community profile data is all stationary, it basically serves as an indicator variable in the study. It does not change over time and, thus, no test of the parellel trends assumption is required for those variables
+
+
+
+
+remove(serco_trends)
+##  Now I am ready to run the first attempt at the difference and differences with the Lakeview, Near North Side, West Town, Lincoln Park, Near West Side and Near South Side as the testing group and Austin, Belmont Crighton, Humboldt Park, Portagage Park and South Shore as the control group. 
+
+```
+
+# DID of Relationship Between SERCO and City Ticketing w/ Stated Policy Change Date
+
+```{r message=FALSE, warning=FALSE}
+## DID units and Neighborhoods
+## Creating the Serco Data Frame with the selected experiment and control groups
+# First to select the relevant variables to make the data set more tidy
+# Outcome Variables: total_payments 
+
+serco_tidy_df <- chi_tickets %>%
+    filter(community_area_name == "LAKE VIEW"| 
+         community_area_name == "NEAR NORTH SIDE"| 
+         community_area_name == "WEST TOWN"|
+         community_area_name == "LINCOLN PARK"|
+         community_area_name == "BRIGHTON PARK"|
+         community_area_name == "NEAR WEST SIDE"|
+         community_area_name == "ROGERS PARK"|
+         community_area_name == "PORTAGE PARK")%>%
+    filter(year %in% (2010:2014))%>%
+  filter(total_payments >= 0)%>%
+  mutate(total_penalties = if_else(current_amount_due >= 0, 
+           total_payments + current_amount_due - fine_level1_amount,
+           total_payments - fine_level1_amount))%>%
+  filter(total_penalties >= 0)%>%
+  mutate(prct_penalty = total_penalties/fine_level1_amount)%>%
+  select(-current_amount_due,
+         -issue_date,
+         -total_payments,
+         -ticket_number, 
+         -fine_level1_amount,
+         -fine_level2_amount)%>%
+  mutate(community_area_number = as.character(community_area_number))%>%
+  mutate(month_n = case_when(month == 2 & year == 2010 ~ "-24",
+                             month == 3 & year == 2010 ~ "-23",
+                             month == 4 & year == 2010 ~ "-22",
+                             month == 5 & year == 2010 ~ "-21",
+                             month == 6 & year == 2010 ~ "-20",
+                             month == 7 & year == 2010 ~ "-19",
+                             month == 8 & year == 2010 ~ "-18",
+                             month == 9 & year == 2010 ~ "-17",
+                             month == 10 & year == 2010 ~ "-16",
+                             month == 11 & year == 2010 ~ "-15",
+                             month == 12 & year == 2010 ~ "-14",
+                             month == 1 & year == 2011 ~ "-13",
+                             month == 2 & year == 2011 ~ "-12",
+                             month == 3 & year == 2011 ~ "-11",
+                             month == 4 & year == 2011 ~ "-10",
+                             month == 5 & year == 2011 ~ "-9",
+                             month == 6 & year == 2011 ~ "-8",
+                             month == 7 & year == 2011 ~ "-7",
+                             month == 8 & year == 2011 ~ "-6",
+                             month == 9 & year == 2011 ~ "-5",
+                             month == 10 & year == 2011 ~ "-4",
+                             month == 11 & year == 2011 ~ "-3",
+                             month == 12 & year == 2011 ~ "-2",
+                             month == 1 & year == 2012 ~ "-1",
+                             month == 2 & year == 2012 ~ "0",
+                             month == 3 & year == 2012 ~ "1",
+                             month == 4 & year == 2012 ~ "2",
+                             month == 5 & year == 2012 ~ "3",
+                             month == 6 & year == 2012 ~ "4",
+                             month == 7 & year == 2012 ~ "5",
+                             month == 8 & year == 2012 ~ "6",
+                             month == 9 & year == 2012 ~ "7",
+                             month == 10 & year == 2012 ~ "8",
+                             month == 11 & year == 2012 ~ "9",
+                             month == 12 & year == 2012 ~ "10",
+                             month == 1 & year == 2013 ~ "11",
+                             month == 2 & year == 2013 ~ "12",
+                             month == 3 & year == 2013 ~ "13",
+                             month == 4 & year == 2013 ~ "14",
+                             month == 5 & year == 2013 ~ "15",
+                             month == 6 & year == 2013 ~ "16",
+                             month == 7 & year == 2013 ~ "17",
+                             month == 8 & year == 2013 ~ "18",
+                             month == 9 & year == 2013 ~ "19",
+                             month == 10 & year == 2013 ~ "20",
+                             month == 11 & year == 2013 ~ "21",
+                             month == 12 & year == 2013 ~ "22",
+                             month == 1 & year == 2014 ~ "23",
+                             month == 2 & year == 2014 ~ "24"))%>%
+  filter(month_n != "NA")
+
+serco_did <- serco_tidy_df %>%
+  group_by(month_n)%>%
+  mutate_at(c('prct_penalty'), ~(scale(.) %>% as.vector))%>%
+  rename(prct_abv_mean_penalty = "prct_penalty")%>%
+  mutate(prct_abv_mean_penalty = as.numeric(prct_abv_mean_penalty))%>%
+  mutate(policy_enacted = if_else(month_n >= 0, 1, 0))%>%
+  mutate(serco_enforced = if_else(
+    community_area_number %in% c("6", "7", "8", "24"), 1, 0))%>%
+  mutate(serco_enforced = as.numeric(serco_enforced), .keep = "unused")%>%
+  mutate(did = policy_enacted*serco_enforced)%>%
+  mutate(policy_enacted = as.factor(policy_enacted), .keep="unused")%>%
+  mutate(serco_enforced = as.factor(serco_enforced), .keep="unused")%>%
+  mutate_at(c('total_commuters'), ~(scale(.) %>% as.vector))%>%
+  mutate_at(c('work_at_home'), ~(scale(.) %>% as.vector))%>%
+  mutate_at(c('med_inc'), ~(scale(.) %>% as.vector))%>%
+  mutate_at(c('park_access'), ~(scale(.) %>% as.vector))%>%
+  mutate_at(c('annual_vehicle_miles'), ~(scale(.) %>% as.vector))%>%
+  mutate_at(c('white'), ~(scale(.) %>% as.vector))%>%
+  mutate_at(c('hisp'), ~(scale(.) %>% as.vector))%>%
+  mutate_at(c('black'), ~(scale(.) %>% as.vector))%>%
+  mutate_at(c('asian'), ~(scale(.) %>% as.vector))
+  
+  
+## Running the DID for the two years around the policy change
+#T(-24:24)
+didreg = lm(prct_abv_mean_penalty ~ 
+              
+            serco_enforced + policy_enacted + did +
+              
+            annual_vehicle_miles + total_commuters + work_at_home + transit+
+            
+            white + hisp + black + asian + med_inc, 
+            
+            data = serco_did)
+
+summary(didreg)
+
+## Testing for difference if the data frame doesn't aggregate tickets to community area level
+
+
+```
+
+## SERCO Enforcement In other Time Periods DID
+
+```{r}
+# T(-12:12)
+serco_did_n12_12 <- serco_did %>%
+  filter(month_n >= -12 & month_n <= 12)
+
+serco_did_n12_12 = lm(prct_abv_mean_penalty ~ 
+              
+            serco_enforced + policy_enacted + did +
+              
+            annual_vehicle_miles + total_commuters + work_at_home + transit+
+            
+            white + hisp + black + asian + med_inc, 
+            
+            data = serco_did_n12_12)
+
+summary(serco_did_n12_12)
+
+# T(-6:6)
+serco_did_n6_6 <- serco_did %>%
+  filter(month_n >= -6 & month_n <= 6)
+
+serco_did_n6_6 = lm(prct_abv_mean_penalty ~ 
+              
+            serco_enforced + policy_enacted + did +
+              
+            annual_vehicle_miles + total_commuters + work_at_home + transit+
+            
+            white + hisp + black + asian + med_inc, 
+            
+            data = serco_did_n6_6 )
+
+summary(serco_did_n6_6)
+
+# T(-5:5)
+serco_did_n5_5 <- serco_did %>%
+  filter(month_n >= -5 & month_n <= 5)
+
+serco_did_n5_5 = lm(prct_abv_mean_penalty ~ 
+              
+            serco_enforced + policy_enacted + did +
+              
+            annual_vehicle_miles + total_commuters + work_at_home + transit+
+            
+            white + hisp + black + asian + med_inc, 
+            
+            data = serco_did_n5_5)
+
+summary(serco_did_n5_5)
+
+# T(-4:4)
+serco_did_n4_4 <- serco_did %>%
+  filter(month_n >= -4 & month_n <= 4)
+
+serco_did_n4_4 = lm(prct_abv_mean_penalty ~ 
+              
+            serco_enforced + policy_enacted + did +
+              
+            annual_vehicle_miles + total_commuters + work_at_home + transit+
+            
+            white + hisp + black + asian + med_inc, 
+            
+            data =serco_did_n4_4)
+
+summary(serco_did_n4_4)
+
+# T(-3:3)
+serco_did_n3_3 <- serco_did %>%
+  filter(month_n >= -3 & month_n <= 3)
+
+serco_did_n3_3 = lm(prct_abv_mean_penalty ~ 
+              
+            serco_enforced + policy_enacted + did +
+              
+            annual_vehicle_miles + total_commuters + work_at_home + transit+
+            
+            white + hisp + black + asian + med_inc, 
+            
+            data = serco_did_n3_3)
+
+summary(serco_did_n3_3)
+
+# T(-2:2)
+serco_did_n2_2 <- serco_did %>%
+  filter(month_n >= -2 & month_n <= 2)
+
+serco_did_n2_2 = lm(prct_abv_mean_penalty ~ 
+              
+            serco_enforced + policy_enacted + did +
+              
+            annual_vehicle_miles + total_commuters + work_at_home + transit+
+            
+            white + hisp + black + asian + med_inc, 
+            
+            data = serco_did_n2_2)
+
+summary(serco_did_n2_2)
+
+# T(-1:1)
+serco_did_n1_1 <- serco_did %>%
+  filter(month_n >= -2 & month_n <= 1)
+
+serco_did_n1_1 = lm(prct_abv_mean_penalty ~ 
+              
+            serco_enforced + policy_enacted + did +
+              
+            annual_vehicle_miles + total_commuters + work_at_home + transit+
+            
+            white + hisp + black + asian + med_inc, 
+            
+            data = serco_did_n1_1)
+
+summary(serco_did_n1_1)
+
+# T(-3:2)
+serco_did_n3_2 <- serco_did %>%
+  filter(month_n >= -3 & month_n <= 2)
+
+serco_did_n3_2 = lm(prct_abv_mean_penalty ~ 
+              
+            serco_enforced + policy_enacted + did +
+              
+            annual_vehicle_miles + total_commuters + work_at_home + transit+
+            
+            white + hisp + black + asian + med_inc, 
+            
+            data = serco_did_n3_2)
+
+summary(serco_did_n3_2)
+
+# T(-3:4)
+serco_did_n3_4 <- serco_did %>%
+  filter(month_n >= -3 & month_n <= 4)
+
+serco_did_n3_4 = lm(prct_abv_mean_penalty ~ 
+              
+            serco_enforced + policy_enacted + did +
+              
+            annual_vehicle_miles + total_commuters + work_at_home + transit+
+            
+            white + hisp + black + asian + med_inc, 
+            
+            data = serco_did_n3_4)
+
+summary(serco_did_n3_4)
+
+# T(-3:5)
+serco_did_n3_5 <- serco_did %>%
+  filter(month_n >= -3 & month_n <= 5)
+
+serco_did_n3_5 = lm(prct_abv_mean_penalty ~ 
+              
+            serco_enforced + policy_enacted + did +
+              
+            annual_vehicle_miles + total_commuters + work_at_home + transit+
+            
+            white + hisp + black + asian + med_inc, 
+            
+            data = serco_did_n3_5)
+
+summary(serco_did_n3_5)
+
+# T(-3:6)
+serco_did_n3_6 <- serco_did %>%
+  filter(month_n >= -3 & month_n <= 6)
+
+serco_did_n3_6 = lm(prct_abv_mean_penalty ~ 
+              
+            serco_enforced + policy_enacted + did +
+              
+            annual_vehicle_miles + total_commuters + work_at_home + transit+
+            
+            white + hisp + black + asian + med_inc, 
+            
+            data = serco_did_n3_6)
+
+summary(serco_did_n3_6)
+
+```
+
+# DID of Relationship Between SERCO and City Ticketing w/ Inflection Date
+
+# 
+
+```{r}
+## DID units and Neighborhoods
+## Creating the Serco Data Frame with the selected experiment and control groups
+# First to select the relevant variables to make the data set more tidy
+# Outcome Variables: total_payments 
+
+serco_tidy_df <- chi_tickets %>%
+    filter(community_area_name == "LAKE VIEW"| 
+         community_area_name == "NEAR NORTH SIDE"| 
+         community_area_name == "WEST TOWN"|
+         community_area_name == "LINCOLN PARK"|
+         community_area_name == "BRIGHTON PARK"|
+         community_area_name == "NEAR WEST SIDE"|
+         community_area_name == "ROGERS PARK"|
+         community_area_name == "PORTAGE PARK")%>%
+    filter(year %in% (2009:2014))%>%
+  filter(total_payments >= 0)%>%
+  mutate(total_penalties = if_else(current_amount_due >= 0, 
+           total_payments + current_amount_due - fine_level1_amount,
+           total_payments - fine_level1_amount))%>%
+  filter(total_penalties >= 0)%>%
+  mutate(prct_penalty = total_penalties/fine_level1_amount)%>%
+  select(-current_amount_due,
+         -issue_date,
+         -total_payments,
+         -ticket_number, 
+         -fine_level1_amount,
+         -fine_level2_amount)%>%
+  mutate(community_area_number = as.character(community_area_number))%>%
+  mutate(month_n = case_when(month == 9 & year == 2009 ~ "-24",
+                             month == 10 & year == 2009 ~ "-23",
+                             month == 11 & year == 2009 ~"-22",
+                             month == 12 & year == 2009 ~ "-21",
+                             month == 1 & year == 2010 ~ "-20",
+                             month == 2 & year == 2010 ~ "-19",
+                             month == 3 & year == 2010 ~ "-18",
+                             month == 4 & year == 2010 ~ "-17",
+                             month == 5 & year == 2010 ~ "-16",
+                             month == 6 & year == 2010 ~ "-15",
+                             month == 7 & year == 2010 ~ "-14",
+                             month == 8 & year == 2010 ~ "-13",
+                             month == 9 & year == 2010 ~ "-12",
+                             month == 10 & year == 2010 ~ "-11",
+                             month == 11 & year == 2010 ~ "-10",
+                             month == 12 & year == 2010 ~ "-9",
+                             month == 1 & year == 2011 ~ "-8",
+                             month == 2 & year == 2011 ~ "-6",
+                             month == 3 & year == 2011 ~ "-5",
+                             month == 4 & year == 2011 ~ "-4",
+                             month == 5 & year == 2011 ~ "-3",
+                             month == 6 & year == 2011 ~ "-2",
+                             month == 7 & year == 2011 ~ "-1",
+                             month == 8 & year == 2011 ~ "0",
+                             month == 9 & year == 2011 ~ "1",
+                             month == 10 & year == 2011 ~ "2",
+                             month == 11 & year == 2011 ~ "3",
+                             month == 12 & year == 2011 ~ "4",
+                             month == 1 & year == 2012 ~ "5",
+                             month == 2 & year == 2012 ~ "6",
+                             month == 3 & year == 2012 ~ "7",
+                             month == 4 & year == 2012 ~ "8",
+                             month == 5 & year == 2012 ~ "9",
+                             month == 6 & year == 2012 ~ "10",
+                             month == 7 & year == 2012 ~ "11",
+                             month == 8 & year == 2012 ~ "12",
+                             month == 9 & year == 2012 ~ "13",
+                             month == 10 & year == 2012 ~ "14",
+                             month == 11 & year == 2012 ~ "15",
+                             month == 12 & year == 2012 ~ "16",
+                             month == 1 & year == 2013 ~ "17",
+                             month == 2 & year == 2013 ~ "17",
+                             month == 3 & year == 2013 ~ "18",
+                             month == 4 & year == 2013 ~ "19",
+                             month == 5 & year == 2013 ~ "20",
+                             month == 6 & year == 2013 ~ "21",
+                             month == 7 & year == 2013 ~ "22",
+                             month == 8 & year == 2013 ~ "23",
+                             month == 9 & year == 2013 ~ "24"))%>%
+  filter(month_n != "NA")
+
+serco_did <- serco_tidy_df %>%
+  group_by(month_n)%>%
+  mutate_at(c('prct_penalty'), ~(scale(.) %>% as.vector))%>%
+  rename(prct_abv_mean_penalty = "prct_penalty")%>%
+  mutate(prct_abv_mean_penalty = as.numeric(prct_abv_mean_penalty))%>%
+  mutate(policy_enacted = if_else(month_n >= 0, 1, 0))%>%
+  mutate(serco_enforced = if_else(
+    community_area_number %in% c("6", "7", "8", "24"), 1, 0))%>%
+  mutate(serco_enforced = as.numeric(serco_enforced), .keep = "unused")%>%
+  mutate(did = policy_enacted*serco_enforced)%>%
+  mutate(policy_enacted = as.factor(policy_enacted), .keep="unused")%>%
+  mutate(serco_enforced = as.factor(serco_enforced), .keep="unused")%>%
+  mutate_at(c('total_commuters'), ~(scale(.) %>% as.vector))%>%
+  mutate_at(c('work_at_home'), ~(scale(.) %>% as.vector))%>%
+  mutate_at(c('med_inc'), ~(scale(.) %>% as.vector))%>%
+  mutate_at(c('park_access'), ~(scale(.) %>% as.vector))%>%
+  mutate_at(c('annual_vehicle_miles'), ~(scale(.) %>% as.vector))%>%
+  mutate_at(c('white'), ~(scale(.) %>% as.vector))%>%
+  mutate_at(c('hisp'), ~(scale(.) %>% as.vector))%>%
+  mutate_at(c('black'), ~(scale(.) %>% as.vector))%>%
+  mutate_at(c('asian'), ~(scale(.) %>% as.vector))
+  
+  
+## Running the DID for the two years around the policy change
+#T(-24:24)
+didreg = lm(prct_abv_mean_penalty ~ 
+              
+            serco_enforced + policy_enacted + did +
+              
+            annual_vehicle_miles + total_commuters + work_at_home + transit+
+            
+            white + hisp + black + asian + med_inc, 
+            
+            data = serco_did)
+
+summary(didreg)
+```
+
+## Other Time Periods w/ Inflection Date
+
+```{r}
+# T(-12:12)
+serco_did_n12_12 <- serco_did %>%
+  filter(month_n >= -12 & month_n <= 12)
+
+serco_did_n12_12 = lm(prct_abv_mean_penalty ~ 
+              
+            serco_enforced + policy_enacted + did +
+              
+            annual_vehicle_miles + park_access + total_commuters + work_at_home +
+            
+            white + hisp + black + asian + med_inc, data = serco_did_n12_12)
+
+summary(serco_did_n12_12)
+
+# T(-6:6)
+serco_did_n6_6 <- serco_did %>%
+  filter(month_n >= -6 & month_n <= 6)
+
+serco_did_n6_6 = lm(prct_abv_mean_penalty ~ 
+              
+            serco_enforced + policy_enacted + did +
+              
+            annual_vehicle_miles + park_access + total_commuters + work_at_home +
+            
+            white + hisp + black + asian + med_inc, 
+            
+            data = serco_did_n6_6 )
+
+summary(serco_did_n6_6)
+
+# T(-5:5)
+serco_did_n5_5 <- serco_did %>%
+  filter(month_n >= -5 & month_n <= 5)
+
+serco_did_n5_5 = lm(prct_abv_mean_penalty ~ 
+              
+            serco_enforced + policy_enacted + did +
+              
+            annual_vehicle_miles + park_access + total_commuters + work_at_home +
+            
+            white + hisp + black + asian + med_inc, 
+            
+            data = serco_did_n5_5)
+
+summary(serco_did_n5_5)
+
+# T(-4:4)
+serco_did_n4_4 <- serco_did %>%
+  filter(month_n >= -4 & month_n <= 4)
+
+serco_did_n4_4 = lm(prct_abv_mean_penalty ~ 
+              
+            serco_enforced + policy_enacted + did +
+              
+            annual_vehicle_miles + park_access + total_commuters + work_at_home +
+            
+            white + hisp + black + asian + med_inc, 
+            
+            data = serco_did_n4_4)
+
+summary(serco_did_n4_4)
+
+# T(-3:3)
+serco_did_n3_3 <- serco_did %>%
+  filter(month_n >= -3 & month_n <= 3)
+
+serco_did_n3_3 = lm(prct_abv_mean_penalty ~ 
+              
+            serco_enforced + policy_enacted + did +
+              
+            annual_vehicle_miles + park_access + total_commuters + work_at_home +
+            
+            white + hisp + black + asian + med_inc, 
+            
+            data = serco_did_n3_3)
+
+summary(serco_did_n3_3)
+
+# T(-2:2)
+serco_did_n2_2 <- serco_did %>%
+  filter(month_n >= -2 & month_n <= 2)
+
+serco_did_n2_2 = lm(prct_abv_mean_penalty ~ 
+              
+            serco_enforced + policy_enacted + did +
+              
+            annual_vehicle_miles + park_access + total_commuters + work_at_home +
+            
+            white + hisp + black + asian + med_inc, 
+            
+            data = serco_did_n2_2)
+
+summary(serco_did_n2_2)
+
+# T(-1:1)
+serco_did_n1_1 <- serco_did %>%
+  filter(month_n >= -2 & month_n <= 1)
+
+serco_did_n1_1 = lm(prct_abv_mean_penalty ~ 
+              
+            serco_enforced + policy_enacted + did +
+              
+            annual_vehicle_miles + park_access + total_commuters + work_at_home +
+            
+            white + hisp + black + asian + med_inc, 
+            
+            data = serco_did_n1_1)
+
+summary(serco_did_n1_1)
+
+# T(-3:2)
+serco_did_n3_2 <- serco_did %>%
+  filter(month_n >= -3 & month_n <= 2)
+
+serco_did_n3_2 = lm(prct_abv_mean_penalty ~ 
+              
+            serco_enforced + policy_enacted + did +
+              
+            annual_vehicle_miles + park_access + total_commuters + work_at_home +
+            
+            white + hisp + black + asian + med_inc, 
+            
+            data = serco_did_n3_2)
+
+summary(serco_did_n3_2)
+
+# T(-3:4)
+serco_did_n3_4 <- serco_did %>%
+  filter(month_n >= -3 & month_n <= 4)
+
+serco_did_n3_4 = lm(prct_abv_mean_penalty ~ 
+              
+            serco_enforced + policy_enacted + did +
+              
+            annual_vehicle_miles + park_access + total_commuters + work_at_home +
+            
+            white + hisp + black + asian + med_inc, 
+            
+            data = serco_did_n3_4)
+
+summary(serco_did_n3_4)
+
+# T(-3:5)
+serco_did_n3_5 <- serco_did %>%
+  filter(month_n >= -3 & month_n <= 5)
+
+serco_did_n3_5 = lm(prct_abv_mean_penalty ~ 
+              
+            serco_enforced + policy_enacted + did +
+              
+            annual_vehicle_miles + park_access + total_commuters + work_at_home +
+            
+            white + hisp + black + asian + med_inc, 
+            
+            data = serco_did_n3_5)
+
+summary(serco_did_n3_5)
+
+# T(-3:6)
+serco_did_n3_6 <- serco_did %>%
+  filter(month_n >= -3 & month_n <= 6)
+
+serco_did_n3_6 = lm(prct_abv_mean_penalty ~ 
+              
+            serco_enforced + policy_enacted + did +
+              
+            annual_vehicle_miles + park_access + total_commuters + work_at_home +
+            
+            white + hisp + black + asian + med_inc, 
+            
+            data = serco_did_n3_6)
+
+summary(serco_did_n3_6)
+
+```
